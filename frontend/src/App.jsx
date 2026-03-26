@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { getGraph, getJob, uploadZip } from './api/client';
 import GraphView from './components/GraphView';
-import StatusPanel from './components/StatusPanel';
 import UploadPanel from './components/UploadPanel';
 
 const terminalStates = new Set(['completed', 'failed']);
@@ -80,8 +79,9 @@ export default function App() {
 
       <section className="top-grid">
         <UploadPanel onUpload={onUpload} disabled={uploading} />
-        <StatusPanel state={jobState} error={error} />
       </section>
+
+      {error ? <p className="error">{error}</p> : null}
 
       <section className="graph-header">
         <h2>Relationship Flow</h2>
