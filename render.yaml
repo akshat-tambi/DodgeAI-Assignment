@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: dodgeai-backend
+    runtime: docker
+    rootDir: backend
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: dodgeai-data
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: APP_HOST
+        value: 0.0.0.0
+      - key: APP_PORT
+        value: 8000
+      - key: CORS_ORIGINS
+        value: https://your-vercel-project.vercel.app
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      - key: MYSQL_HOST
+        value: 127.0.0.1
+      - key: MYSQL_PORT
+        value: 3306
+      - key: MYSQL_DATABASE
+        value: dodgeai
+      - key: MYSQL_USER
+        value: dodgeai
+      - key: MYSQL_PASSWORD
+        sync: false
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USER
+        value: neo4j
+      - key: NEO4J_PASSWORD
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
