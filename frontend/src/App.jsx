@@ -11,6 +11,7 @@ export default function App() {
   const [jobState, setJobState] = useState(null);
   const [graph, setGraph] = useState({ nodes: [], edges: [] });
   const [selectedNode, setSelectedNode] = useState(null);
+  const [chatHighlights, setChatHighlights] = useState({ nodeIds: [], edgeIds: [] });
   const [error, setError] = useState('');
   const [uploading, setUploading] = useState(false);
 
@@ -31,6 +32,7 @@ export default function App() {
               edges: graphResponse.edges || [],
             });
             setSelectedNode(null);
+            setChatHighlights({ nodeIds: [], edgeIds: [] });
           }
           setUploading(false);
           return;
@@ -59,6 +61,7 @@ export default function App() {
     setError('');
     setUploading(true);
     setGraph({ nodes: [], edges: [] });
+    setChatHighlights({ nodeIds: [], edgeIds: [] });
     try {
       const result = await uploadZip(file);
       setJobId(result.job_id);
@@ -85,7 +88,13 @@ export default function App() {
         <p>{graphStats.nodes} nodes · {graphStats.edges} edges</p>
       </section>
 
-      <GraphView graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+      <GraphView
+        graph={graph}
+        selectedNode={selectedNode}
+        onSelectNode={setSelectedNode}
+        chatHighlights={chatHighlights}
+        onChatHighlights={setChatHighlights}
+      />
     </div>
   );
 }

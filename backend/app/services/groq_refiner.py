@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from groq import Groq
@@ -12,6 +13,97 @@ class GroqRefiner:
             raise ValueError("GROQ_API_KEY is required because LLM verification is mandatory")
         self.model = model
         self.client = Groq(api_key=api_key)
+
+    def generate_dataset_context(
+        self,
+        *,
+        schemas: dict[str, Any],
+        accepted_relationships: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        tables = sorted(list(schemas.keys()))[:80]
+        compact_schema: list[dict[str, Any]] = []
+        for table in tables:
+            cols = schemas.get(table, {}).get("columns", [])
+            compact_schema.append(
+                {
+                    "table": table,
+                    "row_count": schemas.get(table, {}).get("row_count", 0),
+                    "columns": [c.get("name") for c in cols[:25] if c.get("name")],
+                }
+            )
+
+        compact_relationships = []
+        for rel in accepted_relationships[:120]:
+            compact_relationships.append(
+                {
+                    "source_table": rel.get("source_table"),
+                    "source_column": rel.get("source_column"),
+                    "target_table": rel.get("target_table"),
+                    "target_column": rel.get("target_column"),
+                    "relationship_type": rel.get("relationship_type"),
+                    "score": rel.get("score"),
+                }
+            )
+
+        prompt = {
+            "task": "Infer domain context from dataset schema and accepted relationships.",
+            "constraints": [
+                "Do not invent entities not present in input.",
+                "Prefer concrete business nouns and process terms.",
+                "Output strict JSON only.",
+            ],
+            "input": {
+                "tables": tables,
+                "schemas": compact_schema,
+                "accepted_relationships": compact_relationships,
+            },
+            "response_schema": {
+                "domain_terms": ["array_of_strings_max_60"],
+                "entity_terms": ["array_of_strings_max_80"],
+                "process_terms": ["array_of_strings_max_40"],
+                "summary": "string_max_220_chars",
+            },
+        }
+
+        fallback = self._fallback_dataset_context(schemas=schemas)
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a precise data model analyst. Return JSON only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt, separators=(",", ":")),
+                    },
+                ],
+            )
+            content = completion.choices[0].message.content or "{}"
+            parsed = self._parse_json(content)
+            if not isinstance(parsed, dict):
+                return fallback
+
+            domain_terms = self._sanitize_term_list(parsed.get("domain_terms"), max_items=60)
+            entity_terms = self._sanitize_term_list(parsed.get("entity_terms"), max_items=80)
+            process_terms = self._sanitize_term_list(parsed.get("process_terms"), max_items=40)
+            summary = str(parsed.get("summary", "")).strip()[:220]
+
+            if not domain_terms and not entity_terms and not process_terms:
+                return fallback
+
+            return {
+                "domain_terms": domain_terms,
+                "entity_terms": entity_terms,
+                "process_terms": process_terms,
+                "summary": summary,
+                "source": "llm",
+            }
+        except Exception:
+            return fallback
 
     def verify_all(
         self,
@@ -316,3 +408,45 @@ class GroqRefiner:
             if start >= 0 and end > start:
                 return json.loads(raw[start : end + 1])
             return {}
+
+    @staticmethod
+    def _sanitize_term_list(value: Any, *, max_items: int) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        out: list[str] = []
+        for item in value:
+            term = str(item or "").strip().lower()
+            if not term or len(term) < 2:
+                continue
+            if term not in out:
+                out.append(term)
+            if len(out) >= max_items:
+                break
+        return out
+
+    @staticmethod
+    def _fallback_dataset_context(*, schemas: dict[str, Any]) -> dict[str, Any]:
+        token_counter: dict[str, int] = {}
+
+        def add_token(raw: str) -> None:
+            for tok in re.findall(r"[a-zA-Z][a-zA-Z0-9]+", raw or ""):
+                t = tok.lower()
+                if len(t) < 3:
+                    continue
+                token_counter[t] = token_counter.get(t, 0) + 1
+
+        for table, meta in schemas.items():
+            add_token(table)
+            for col in meta.get("columns", [])[:40]:
+                add_token(str(col.get("name", "")))
+
+        terms = sorted(token_counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_terms = [k for k, _ in terms[:60]]
+
+        return {
+            "domain_terms": top_terms,
+            "entity_terms": [str(t).lower() for t in list(schemas.keys())[:80]],
+            "process_terms": [t for t in top_terms if t in {"order", "delivery", "billing", "invoice", "payment", "customer", "product"}],
+            "summary": "Auto-generated from schema tokens.",
+            "source": "fallback",
+        }

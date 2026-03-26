@@ -8,9 +8,10 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 
 from app.config import get_settings
-from app.models.schemas import GraphResponse, JobStatusResponse, UploadResponse
+from app.models.schemas import ChatRequest, ChatResponse, GraphResponse, JobStatusResponse, UploadResponse
 from app.pipeline.neo4j_loader import Neo4jGraphLoader
 from app.pipeline.orchestrator import process_upload_job
+from app.services.chat_service import ChatService
 from app.services.groq_refiner import GroqRefiner
 from app.services.job_store import JobStore, UploadRateLimiter
 
@@ -21,10 +22,22 @@ settings = get_settings()
 UPLOAD_DIR = Path(settings.upload_dir)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-job_store = JobStore()
+job_store = JobStore(
+    mysql_host=settings.mysql_host,
+    mysql_port=settings.mysql_port,
+    mysql_user=settings.mysql_user,
+    mysql_password=settings.mysql_password,
+    mysql_database=settings.mysql_database,
+)
 rate_limiter = UploadRateLimiter(settings.rate_limit_uploads_per_minute)
 neo4j_loader = Neo4jGraphLoader(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
 groq_refiner = GroqRefiner(settings.groq_api_key, settings.groq_model)
+chat_service = ChatService(
+    groq_api_key=settings.groq_api_key,
+    groq_model=settings.groq_model,
+    neo4j_loader=neo4j_loader,
+    job_store=job_store,
+)
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -117,3 +130,17 @@ async def get_latest_graph(view: str = Query("granular", pattern="^(granular|tab
             "view": view,
         },
     )
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_with_graph(payload: ChatRequest) -> ChatResponse:
+    question = (payload.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    result = await chat_service.answer(
+        question=question,
+        conversation_id=payload.conversation_id,
+        selected_node_id=payload.selected_node_id,
+    )
+    return ChatResponse(**result)

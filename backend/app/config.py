@@ -32,6 +32,12 @@ class Settings(BaseSettings):
 
     rate_limit_uploads_per_minute: int = Field(default=10, alias="RATE_LIMIT_UPLOADS_PER_MINUTE")
 
+    mysql_host: str = Field(default="", alias="MYSQL_HOST")
+    mysql_port: int = Field(default=3306, alias="MYSQL_PORT")
+    mysql_user: str = Field(default="", alias="MYSQL_USER")
+    mysql_password: str = Field(default="", alias="MYSQL_PASSWORD")
+    mysql_database: str = Field(default="", alias="MYSQL_DATABASE")
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

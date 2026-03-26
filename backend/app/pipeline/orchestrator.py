@@ -267,6 +267,19 @@ async def process_upload_job(
             len(llm_rejected),
         )
 
+        await update_stage("dataset_context", "Generating dataset context profile with Groq")
+        dataset_context = groq_refiner.generate_dataset_context(
+            schemas=schemas,
+            accepted_relationships=accepted,
+        )
+        logger.info(
+            "pipeline dataset_context job_id=%s source=%s domain_terms=%s entity_terms=%s",
+            job_id,
+            dataset_context.get("source", "unknown"),
+            len(dataset_context.get("domain_terms", [])),
+            len(dataset_context.get("entity_terms", [])),
+        )
+
         await update_stage("graph_build", "Building graph payload")
         table_graph_payload = build_table_graph(relationalized_tables, accepted, parent_child_links)
         table_graph_payload = graph_to_payload(table_graph_payload)
@@ -281,7 +294,7 @@ async def process_upload_job(
         )
 
         await update_stage("neo4j_load", "Loading graph into Neo4j")
-        neo4j_loader.load_graph(table_graph_payload)
+        neo4j_loader.load_graph(granular_graph_payload)
         neo4j_graph = neo4j_loader.fetch_graph()
         logger.info(
             "pipeline neo4j_load job_id=%s persisted_nodes=%s persisted_edges=%s",
@@ -294,6 +307,7 @@ async def process_upload_job(
             "tables": list(relationalized_tables.keys()),
             "schemas": schemas,
             "key_candidates": key_candidates,
+            "dataset_context": dataset_context,
             "relationships": {
                 "accepted": accepted,
                 "borderline": borderline,
@@ -308,7 +322,7 @@ async def process_upload_job(
                     for p, pk, c, ck in parent_child_links
                 ],
             },
-            "graph_table": neo4j_graph if neo4j_graph["nodes"] else table_graph_payload,
+            "graph_table": table_graph_payload,
             "graph_granular": granular_graph_payload,
             "graph": granular_graph_payload,
             "events": events,

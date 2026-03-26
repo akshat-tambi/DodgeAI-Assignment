@@ -159,3 +159,37 @@ class Neo4jGraphLoader:
 
             logger.info("neo4j fetch completed nodes=%s edges=%s", len(nodes), len(edges))
             return {"nodes": nodes, "edges": edges}
+
+    def run_read_query(self, cypher: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        if not self.enabled:
+            logger.info("neo4j read query skipped (loader disabled)")
+            return []
+
+        def _normalize(value: Any) -> Any:
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, list):
+                return [_normalize(v) for v in value]
+            if isinstance(value, dict):
+                return {str(k): _normalize(v) for k, v in value.items()}
+
+            # neo4j graph objects expose mapping-like properties and optional ids.
+            properties = getattr(value, "_properties", None)
+            if isinstance(properties, dict):
+                normalized: dict[str, Any] = {str(k): _normalize(v) for k, v in properties.items()}
+                element_id = getattr(value, "element_id", None)
+                if element_id is not None:
+                    normalized.setdefault("element_id", str(element_id))
+                return normalized
+
+            try:
+                return str(value)
+            except Exception:
+                return None
+
+        with self._driver.session() as session:
+            result = session.run(cypher, params or {})
+            rows: list[dict[str, Any]] = []
+            for record in result:
+                rows.append({str(k): _normalize(v) for k, v in record.data().items()})
+            return rows

@@ -34,3 +34,24 @@ export async function getGraph(view = 'granular') {
   }
   return response.json();
 }
+
+export async function queryChat({ question, conversationId, selectedNodeId }) {
+  const response = await fetch(`${API_BASE}/chat`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      question,
+      conversation_id: conversationId || null,
+      selected_node_id: selectedNodeId || null,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Unable to run chat query');
+  }
+
+  return response.json();
+}

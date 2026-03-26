@@ -172,6 +172,56 @@ body {
   padding: 8px 10px;
 }
 
+.chat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-messages {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px;
+  min-height: 160px;
+  max-height: 260px;
+  overflow: auto;
+  background: #fbfdff;
+}
+
+.chat-msg {
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 0.84rem;
+}
+
+.chat-msg.user {
+  background: #eef6ff;
+  border: 1px solid #d3e6ff;
+}
+
+.chat-msg.assistant {
+  background: #f4fbf8;
+  border: 1px solid #d6efe6;
+}
+
+.chat-msg p {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-evidence {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed #cfe3dc;
+}
+
+.chat-evidence p {
+  margin: 0 0 3px;
+  font-size: 0.75rem;
+}
+
 .point-node {
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.8);

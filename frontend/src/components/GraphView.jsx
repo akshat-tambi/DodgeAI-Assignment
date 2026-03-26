@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Graph from 'graphology';
 import Sigma from 'sigma';
+import ChatPanel from './ChatPanel';
 
 const TABLE_COLORS = [
   '#5ca8ff',
@@ -138,7 +139,7 @@ function FieldList({ fields }) {
   );
 }
 
-export default function GraphView({ graph, selectedNode, onSelectNode }) {
+export default function GraphView({ graph, selectedNode, onSelectNode, chatHighlights, onChatHighlights }) {
   const [zoomLevel, setZoomLevel] = useState(1);
   const [isFocusLocked, setIsFocusLocked] = useState(false);
   const [lockedFocusNode, setLockedFocusNode] = useState(null);
@@ -283,17 +284,33 @@ export default function GraphView({ graph, selectedNode, onSelectNode }) {
     if (!renderer || !sigmaGraph) return;
 
     const linkFocusNode = isFocusLocked && lockedFocusNode ? lockedFocusNode : selectedNode;
+    const highlightedNodeSet = new Set(chatHighlights?.nodeIds || []);
+    const highlightedEdgeSet = new Set(chatHighlights?.edgeIds || []);
+    const hasChatHighlights = highlightedNodeSet.size > 0 || highlightedEdgeSet.size > 0;
 
     const selectedNeighbors = new Set(adjacency.neighbors.get(linkFocusNode) || []);
     const selectedEdges = new Set(adjacency.incidentEdges.get(linkFocusNode) || []);
 
     sigmaGraph.forEachNode((node, attrs) => {
-      if (!selectedNode) {
+      if (!selectedNode && !hasChatHighlights) {
         sigmaGraph.mergeNodeAttributes(node, {
           color: attrs.baseColor || attrs.color,
           size: attrs.baseSize || attrs.size,
           hidden: false,
           zIndex: 0,
+        });
+        return;
+      }
+
+      if (!selectedNode && hasChatHighlights) {
+        const isHighlighted = highlightedNodeSet.has(node);
+        sigmaGraph.mergeNodeAttributes(node, {
+          color: attrs.baseColor || attrs.color,
+          size: isHighlighted
+            ? Math.max(1.6, (attrs.baseSize || attrs.size) * 2.0)
+            : Math.max(0.45, (attrs.baseSize || attrs.size) * 0.75),
+          hidden: false,
+          zIndex: isHighlighted ? 12 : 0,
         });
         return;
       }
@@ -333,12 +350,25 @@ export default function GraphView({ graph, selectedNode, onSelectNode }) {
     });
 
     sigmaGraph.forEachEdge((edge, attrs) => {
-      if (!selectedNode) {
+      if (!selectedNode && !hasChatHighlights) {
         sigmaGraph.mergeEdgeAttributes(edge, {
           color: attrs.baseColor || attrs.color,
           size: attrs.baseSize || attrs.size,
           hidden: false,
           zIndex: 0,
+        });
+        return;
+      }
+
+      if (!selectedNode && hasChatHighlights) {
+        const isHighlighted = highlightedEdgeSet.has(edge);
+        sigmaGraph.mergeEdgeAttributes(edge, {
+          color: attrs.baseColor || attrs.color,
+          size: isHighlighted
+            ? Math.max(1.6, (attrs.baseSize || attrs.size) * 2.1)
+            : Math.max(0.2, (attrs.baseSize || attrs.size) * 0.5),
+          hidden: false,
+          zIndex: isHighlighted ? 10 : 0,
         });
         return;
       }
@@ -362,7 +392,7 @@ export default function GraphView({ graph, selectedNode, onSelectNode }) {
     });
 
     renderer.refresh();
-  }, [selectedNode, adjacency, isFocusLocked, lockedFocusNode]);
+  }, [selectedNode, adjacency, isFocusLocked, lockedFocusNode, chatHighlights]);
 
   const renderedEdges = allEdges.length;
 
@@ -412,15 +442,10 @@ export default function GraphView({ graph, selectedNode, onSelectNode }) {
           )}
         </div>
 
-        <div className="side-card chat-mock">
-          <h3>Chat with Graph</h3>
-          <p className="muted">Order to Cash</p>
-          <p>Ask questions about a selected row or linked records.</p>
-          <div className="chat-input-row">
-            <input disabled placeholder="Analyze anything" />
-            <button disabled>Send</button>
-          </div>
-        </div>
+        <ChatPanel
+          selectedNodeId={selectedNode}
+          onHighlights={(next) => onChatHighlights(next)}
+        />
       </aside>
     </section>
   );
