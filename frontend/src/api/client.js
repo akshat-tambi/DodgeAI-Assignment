@@ -26,8 +26,10 @@ export async function getJob(jobId) {
   return response.json();
 }
 
-export async function getGraph(view = 'granular') {
-  const response = await fetch(`${API_BASE}/graph?view=${encodeURIComponent(view)}`);
+export async function getGraph(view = 'granular', jobId = '') {
+  const params = new URLSearchParams({ view });
+  if (jobId) params.set('job_id', jobId);
+  const response = await fetch(`${API_BASE}/graph?${params.toString()}`);
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Unable to fetch graph');

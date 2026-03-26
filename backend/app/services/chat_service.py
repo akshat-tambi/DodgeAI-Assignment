@@ -129,7 +129,9 @@ class ChatService:
             dataset_context=dataset_context,
         )
 
-        cypher = self._sanitize_read_only_cypher(str(planner.get("cypher", "")))
+        planned_cypher = str(planner.get("cypher", ""))
+        cypher = self._sanitize_read_only_cypher(planned_cypher)
+        query_trace = self._build_query_trace(planned=planned_cypher, executed=cypher)
         if not cypher:
             return {
                 "job_id": job_id,
@@ -140,17 +142,68 @@ class ChatService:
                     "cypher": "",
                     "row_count": 0,
                     "reasoning": "Planner failed to produce a safe read-only query",
+                    "queries": query_trace,
                 },
                 "highlights": {"node_ids": [], "edge_ids": []},
             }
 
         rows = self.neo4j_loader.run_read_query(cypher)
+        query_contract = planner.get("_query_contract") if isinstance(planner.get("_query_contract"), dict) else {}
+        if not query_contract:
+            query_contract = self._derive_query_contract(
+                question=question,
+                tables=state.metadata.get("tables", []),
+                table_columns={
+                    str(table): [str(c.get("name")) for c in (spec.get("columns", [])[:20])]
+                    for table, spec in (state.metadata.get("schemas", {}) or {}).items()
+                    if isinstance(spec, dict)
+                },
+                relationships=[
+                    {
+                        "source_table": r.get("source_table"),
+                        "source_column": r.get("source_column"),
+                        "target_table": r.get("target_table"),
+                        "target_column": r.get("target_column"),
+                        "relationship_type": r.get("relationship_type"),
+                        "score": r.get("score"),
+                    }
+                    for r in (state.metadata.get("relationships", {}).get("accepted", [])[:40])
+                ],
+                schema_profile=self._derive_schema_profile(state.metadata),
+            )
+
+        if self._is_degenerate_aggregation_result(query_contract=query_contract, rows=rows):
+            repaired_cypher = self._repair_query_from_results(
+                question=question,
+                current_cypher=cypher,
+                rows=rows,
+                metadata=state.metadata,
+                query_contract=query_contract,
+            )
+            repaired_safe = self._sanitize_read_only_cypher(repaired_cypher)
+            if repaired_safe and repaired_safe != cypher:
+                repaired_rows = self.neo4j_loader.run_read_query(repaired_safe)
+                if repaired_rows and not self._is_degenerate_aggregation_result(query_contract=query_contract, rows=repaired_rows):
+                    cypher = repaired_safe
+                    rows = repaired_rows
+                    query_trace.append({"stage": "repaired_execution", "cypher": repaired_safe})
+
+        analysis_rows = rows
+
+        if self._should_enrich_with_links(question=question, cypher=cypher, rows=rows):
+            enrichment_cypher = self._build_link_enrichment_query(cypher)
+            if enrichment_cypher:
+                linked_rows = self.neo4j_loader.run_read_query(enrichment_cypher)
+                if linked_rows:
+                    analysis_rows = linked_rows
+                    query_trace.append({"stage": "enrichment", "cypher": enrichment_cypher})
+
         answer = self._synthesize_answer(
             question=question,
-            rows=rows,
+            rows=analysis_rows,
             planner_reasoning=str(planner.get("reasoning", ""))[:500],
         )
-        highlights = self._extract_highlights(rows)
+        highlights = self._extract_highlights(analysis_rows)
 
         await self.job_store.append_conversation_turn(
             conv_id,
@@ -166,11 +219,89 @@ class ChatService:
             "domain_allowed": True,
             "evidence": {
                 "cypher": cypher,
-                "row_count": len(rows),
+                "row_count": len(analysis_rows),
                 "reasoning": str(planner.get("reasoning", ""))[:500],
+                "queries": query_trace,
             },
             "highlights": highlights,
         }
+
+    def _build_query_trace(self, *, planned: str, executed: str) -> list[dict[str, str]]:
+        trace: list[dict[str, str]] = []
+        planned_text = (planned or "").strip()
+        executed_text = (executed or "").strip()
+
+        if planned_text:
+            trace.append({"stage": "planned", "cypher": planned_text})
+
+        if executed_text:
+            stage = "executed" if planned_text and executed_text != planned_text else "planned"
+            if not trace or trace[-1]["cypher"] != executed_text:
+                trace.append({"stage": stage, "cypher": executed_text})
+
+        return trace
+
+    def _should_enrich_with_links(self, *, question: str, cypher: str, rows: list[dict[str, Any]]) -> bool:
+        if not rows:
+            return False
+
+        lowered_cypher = (cypher or "").lower()
+        if "graph_edge" in lowered_cypher:
+            return False
+
+        if not self._rows_are_node_only(rows):
+            return False
+
+        q = (question or "").lower()
+        return any(token in q for token in ("analysis", "analyze", "analyse", "link", "relationship", "related"))
+
+    def _rows_are_node_only(self, rows: list[dict[str, Any]]) -> bool:
+        allowed = {"id", "label", "entity", "data"}
+        checked = 0
+        for row in rows[:5]:
+            if not isinstance(row, dict):
+                continue
+            keys = {str(k).lower() for k in row.keys()}
+            if not keys or not keys.issubset(allowed):
+                return False
+            checked += 1
+        return checked > 0
+
+    def _build_link_enrichment_query(self, cypher: str) -> str:
+        text = (cypher or "").strip()
+        pattern = re.compile(
+            r"^MATCH\s*\(\s*(?P<var>[A-Za-z_]\w*)\s*:\s*GraphNode\s*\)\s*"
+            r"WHERE\s*(?P<where>.+?)\s*"
+            r"RETURN\s+.+?(?:\s+LIMIT\s+(?P<limit>\d+))?\s*$",
+            re.IGNORECASE | re.DOTALL,
+        )
+        match = pattern.match(text)
+        if not match:
+            return ""
+
+        var_name = match.group("var")
+        where_clause = (match.group("where") or "").strip()
+        if not where_clause:
+            return ""
+
+        raw_limit = match.group("limit")
+        limit = 50
+        if raw_limit:
+            try:
+                limit = max(1, min(int(raw_limit), 50))
+            except Exception:
+                limit = 50
+
+        return (
+            f"MATCH ({var_name}:GraphNode) "
+            f"WHERE {where_clause} "
+            f"OPTIONAL MATCH ({var_name})-[r:GRAPH_EDGE]-(m:GraphNode) "
+            "RETURN DISTINCT "
+            f"{var_name}.id AS source_id, {var_name}.label AS source_label, {var_name}.entity AS source_entity, {var_name}.data AS source_data, "
+            "r.id AS edge_id, r.label AS edge_label, r.relationship_type AS edge_type, r.score AS edge_score, r.columns AS edge_columns, "
+            "m.id AS target_id, m.label AS target_label, m.entity AS target_entity, m.data AS target_data "
+            f"LIMIT {limit}"
+        )
 
     async def _ensure_job_graph_loaded(self, *, job_id: str, metadata: dict[str, Any]) -> None:
         if self._active_job_id == job_id:
@@ -233,6 +364,15 @@ class ChatService:
             for r in accepted
         ]
 
+        schema_profile = self._derive_schema_profile(metadata)
+        query_contract = self._derive_query_contract(
+            question=question,
+            tables=tables,
+            table_columns=table_columns,
+            relationships=compact_relationships,
+            schema_profile=schema_profile,
+        )
+
         prompt = {
             "task": "Generate one safe read-only Cypher query for the business question.",
             "constraints": [
@@ -255,6 +395,11 @@ class ChatService:
                 "If user asks for links/relationships around a field-value lookup, include OPTIONAL MATCH (n)-[r:GRAPH_EDGE]-(m:GraphNode) and return linked node/edge columns.",
                 "Prefer fields from known_columns and tables from tables when possible.",
                 "For regex on n.data, ensure full-string match works by including leading and trailing .* around the key/value pattern.",
+                "If asked for highest/top entities, use aggregation with COUNT or SUM, ORDER BY descending, and return ranked rows.",
+                "If asked to trace a document flow across lifecycle stages, use chained OPTIONAL MATCH across related nodes and return stage-wise entities/ids.",
+                "If asked to find broken or incomplete flows, use OPTIONAL MATCH and filter missing hops with IS NULL conditions.",
+                "When links are requested, include edge metadata (relationship_type, columns, score) to ground the answer.",
+                "Infer lifecycle stages from schema_profile.table_name_signals and relationships rather than relying on fixed business labels.",
             ],
             "selected_node_id": selected_node_id,
             "question": question,
@@ -263,6 +408,8 @@ class ChatService:
             "tables": tables,
             "table_columns": table_columns,
             "known_columns": known_columns,
+            "schema_profile": schema_profile,
+            "query_contract": query_contract,
             "relationships": compact_relationships,
             "response_schema": {
                 "cypher": "string",
@@ -288,10 +435,306 @@ class ChatService:
             content = completion.choices[0].message.content or "{}"
             parsed = self._parse_json(content)
             if isinstance(parsed, dict):
+                candidate_cypher = str(parsed.get("cypher", "")).strip()
+                if candidate_cypher and not self._cypher_satisfies_intent(candidate_cypher, query_contract):
+                    repaired = self._repair_query_plan(
+                        question=question,
+                        candidate_plan=parsed,
+                        query_contract=query_contract,
+                        tables=tables,
+                        table_columns=table_columns,
+                        relationships=compact_relationships,
+                        schema_profile=schema_profile,
+                    )
+                    if isinstance(repaired, dict) and str(repaired.get("cypher", "")).strip():
+                        repaired_cypher = str(repaired.get("cypher", "")).strip()
+                        if self._cypher_satisfies_intent(repaired_cypher, query_contract):
+                            repaired["_query_contract"] = query_contract
+                            return repaired
+                parsed["_query_contract"] = query_contract
                 return parsed
             return {}
         except Exception:
             return {}
+
+    def _derive_query_contract(
+        self,
+        *,
+        question: str,
+        tables: list[Any],
+        table_columns: dict[str, list[str]],
+        relationships: list[dict[str, Any]],
+        schema_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        prompt = {
+            "task": "Infer query intent contract from user question and dataset schema context.",
+            "question": question,
+            "schema_profile": schema_profile,
+            "tables": tables,
+            "table_columns": table_columns,
+            "relationships": relationships,
+            "rules": [
+                "Do not rely on fixed business keywords.",
+                "Use schema and relationship context to infer whether aggregation/traversal/missingness logic is required.",
+                "Return JSON only.",
+            ],
+            "response_schema": {
+                "needs_aggregation": "boolean",
+                "needs_relationship_traversal": "boolean",
+                "needs_missingness_logic": "boolean",
+                "expects_ranked_output": "boolean",
+            },
+        }
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict intent contract generator. Return JSON only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt, separators=(",", ":")),
+                    },
+                ],
+            )
+            parsed = self._parse_json(completion.choices[0].message.content or "{}")
+            if isinstance(parsed, dict):
+                return {
+                    "needs_aggregation": bool(parsed.get("needs_aggregation", False)),
+                    "needs_relationship_traversal": bool(parsed.get("needs_relationship_traversal", False)),
+                    "needs_missingness_logic": bool(parsed.get("needs_missingness_logic", False)),
+                    "expects_ranked_output": bool(parsed.get("expects_ranked_output", False)),
+                }
+        except Exception:
+            pass
+
+        return {
+            "needs_aggregation": False,
+            "needs_relationship_traversal": False,
+            "needs_missingness_logic": False,
+            "expects_ranked_output": False,
+        }
+
+    def _cypher_satisfies_intent(self, cypher: str, query_contract: dict[str, Any]) -> bool:
+        text = (cypher or "").lower()
+
+        if query_contract.get("needs_aggregation"):
+            has_agg = any(token in text for token in ("count(", "sum(", "avg(", "min(", "max("))
+            has_rank = "order by" in text if query_contract.get("expects_ranked_output") else True
+            if not (has_agg and has_rank):
+                return False
+
+        if query_contract.get("needs_relationship_traversal"):
+            has_rel = "graph_edge" in text or "-[" in text
+            if not has_rel:
+                return False
+
+        if query_contract.get("needs_missingness_logic"):
+            has_missing_logic = any(token in text for token in (" is null", " is not null", "coalesce(", "case "))
+            if not has_missing_logic:
+                return False
+
+        return True
+
+    def _repair_query_plan(
+        self,
+        *,
+        question: str,
+        candidate_plan: dict[str, Any],
+        query_contract: dict[str, Any],
+        tables: list[Any],
+        table_columns: dict[str, list[str]],
+        relationships: list[dict[str, Any]],
+        schema_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        prompt = {
+            "task": "Revise the Cypher so it satisfies query intent while remaining safe/read-only.",
+            "question": question,
+            "query_contract": query_contract,
+            "current_plan": {
+                "cypher": str(candidate_plan.get("cypher", "")),
+                "reasoning": str(candidate_plan.get("reasoning", "")),
+            },
+            "constraints": [
+                "Graph model uses (n:GraphNode) and [r:GRAPH_EDGE].",
+                "Use n.entity for table filtering; row fields live in n.data JSON.",
+                "Read-only query only. No APOC/CALL/write clauses.",
+                "LIMIT <= 50.",
+                "Return JSON only with keys cypher and reasoning.",
+            ],
+            "schema_profile": schema_profile,
+            "tables": tables,
+            "table_columns": table_columns,
+            "relationships": relationships,
+            "response_schema": {
+                "cypher": "string",
+                "reasoning": "string_max_120_words",
+            },
+        }
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict Cypher planner repairer. Return JSON only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt, separators=(",", ":")),
+                    },
+                ],
+            )
+            content = completion.choices[0].message.content or "{}"
+            parsed = self._parse_json(content)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _is_degenerate_aggregation_result(self, *, query_contract: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+        if not query_contract.get("needs_aggregation"):
+            return False
+        if not rows:
+            return False
+
+        numeric_keys: set[str] = set()
+        sample = [row for row in rows[:20] if isinstance(row, dict)]
+        if not sample:
+            return False
+
+        for key in sample[0].keys():
+            values = [r.get(key) for r in sample]
+            numeric_values = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            if len(numeric_values) >= max(2, int(0.6 * len(sample))):
+                key_l = str(key).lower()
+                if key_l not in {"id"} and not key_l.endswith("_id"):
+                    numeric_keys.add(str(key))
+
+        if not numeric_keys:
+            return False
+
+        spreads = []
+        for key in numeric_keys:
+            vals = [row.get(key) for row in sample if isinstance(row.get(key), (int, float))]
+            if vals:
+                spreads.append(max(vals) - min(vals))
+        return bool(spreads) and all(spread == 0 for spread in spreads)
+
+    def _repair_query_from_results(
+        self,
+        *,
+        question: str,
+        current_cypher: str,
+        rows: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        query_contract: dict[str, Any],
+    ) -> str:
+        tables = metadata.get("tables", [])[:60]
+        schemas = metadata.get("schemas", {})
+        table_columns = {
+            str(table): [str(c.get("name")) for c in (spec.get("columns", [])[:30])]
+            for table, spec in schemas.items()
+            if isinstance(spec, dict)
+        }
+        accepted = metadata.get("relationships", {}).get("accepted", [])[:80]
+        relationships = [
+            {
+                "source_table": r.get("source_table"),
+                "source_column": r.get("source_column"),
+                "target_table": r.get("target_table"),
+                "target_column": r.get("target_column"),
+                "relationship_type": r.get("relationship_type"),
+                "score": r.get("score"),
+            }
+            for r in accepted
+        ]
+        schema_profile = self._derive_schema_profile(metadata)
+
+        prompt = {
+            "task": "Repair Cypher when aggregation results are degenerate while staying fully dataset-grounded.",
+            "question": question,
+            "query_contract": query_contract,
+            "current_cypher": current_cypher,
+            "result_signal": {
+                "row_count": len(rows),
+                "sample_rows": rows[:5],
+                "issue": "Aggregation metric appears degenerate (all zeros).",
+            },
+            "constraints": [
+                "Use only (n:GraphNode) and [r:GRAPH_EDGE] patterns.",
+                "Use n.entity for table/entity filtering and n.data for row-level fields.",
+                "For ranking questions, ensure ORDER BY on a meaningful aggregate metric.",
+                "Do not hardcode business constants; infer joins from relationships and table_columns.",
+                "Read-only Cypher only. LIMIT <= 50.",
+                "Return JSON only: {cypher, reasoning}.",
+            ],
+            "tables": tables,
+            "table_columns": table_columns,
+            "relationships": relationships,
+            "schema_profile": schema_profile,
+            "response_schema": {
+                "cypher": "string",
+                "reasoning": "string_max_120_words",
+            },
+        }
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict Cypher planner repairer. Return JSON only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt, separators=(",", ":")),
+                    },
+                ],
+            )
+            parsed = self._parse_json(completion.choices[0].message.content or "{}")
+            if isinstance(parsed, dict):
+                return str(parsed.get("cypher", ""))
+            return ""
+        except Exception:
+            return ""
+
+    def _derive_schema_profile(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        tables = [str(t).strip().lower() for t in metadata.get("tables", []) if str(t).strip()]
+        accepted = metadata.get("relationships", {}).get("accepted", [])
+
+        degree: dict[str, int] = {}
+        role_signals: dict[str, list[str]] = {}
+
+        for table in tables:
+            degree[table] = 0
+            parts = [part for part in re.split(r"[^a-z0-9]+", table) if part]
+            # Keep only informative substrings and avoid one-off noise.
+            signals = [p for p in parts if len(p) >= 3]
+            if signals:
+                role_signals[table] = signals[:8]
+
+        for rel in accepted[:200]:
+            source = str(rel.get("source_table") or "").strip().lower()
+            target = str(rel.get("target_table") or "").strip().lower()
+            if source:
+                degree[source] = degree.get(source, 0) + 1
+            if target:
+                degree[target] = degree.get(target, 0) + 1
+
+        top_tables = sorted(degree.items(), key=lambda x: x[1], reverse=True)[:15]
+        return {
+            "table_count": len(tables),
+            "top_connected_tables": [name for name, _ in top_tables],
+            "table_name_signals": role_signals,
+        }
 
     def _collect_domain_terms(self, *, dataset_context: dict[str, Any], metadata: dict[str, Any]) -> set[str]:
         terms = set(_BASE_DOMAIN_TERMS)
@@ -397,9 +840,9 @@ class ChatService:
             if not raw:
                 return match.group(0)
 
-            # If caller already supplied a broad match, keep it as-is.
-            if ".*" in raw:
-                return match.group(0)
+            canonical = self._canonicalize_json_key_value_regex(raw)
+            if canonical:
+                return f"n.data =~ '{canonical}'"
 
             pattern = raw
             prefix = ""
@@ -411,6 +854,35 @@ class ChatService:
             return f"n.data =~ '{normalized}'"
 
         return re.sub(r"n\.data\s*=~\s*'(?P<pattern>[^']*)'", repl, query, flags=re.IGNORECASE)
+
+    def _canonicalize_json_key_value_regex(self, raw_pattern: str) -> str | None:
+        raw = (raw_pattern or "").strip()
+        if not raw:
+            return None
+
+        # Drop common regex prefixes/suffixes to inspect the JSON key:value intent.
+        core = raw
+        core = re.sub(r"^\(\?[isx-]+\)", "", core, flags=re.IGNORECASE)
+        core = re.sub(r"^\.\*", "", core)
+        core = re.sub(r"\.\*$", "", core)
+        core = core.replace(r'\"', '"')
+
+        m = re.search(r'"(?P<key>[A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"?(?P<value>[^"\s][^"]*?)"?$', core)
+        if not m:
+            return None
+
+        key = m.group("key").strip()
+        value = m.group("value").strip()
+        if not key or not value:
+            return None
+
+        # Only canonicalize literal value lookups, not explicit regex-heavy patterns.
+        if re.search(r"[\[\]{}()|+*?]", value):
+            return None
+
+        key_re = re.escape(key)
+        val_re = re.escape(value)
+        return f"(?is).*\\\"{key_re}\\\"\\s*:\\s*\\\"?{val_re}\\\"?.*"
 
     def _rewrite_legacy_node_lookup_query(self, query: str) -> str | None:
         text = (query or "").strip()

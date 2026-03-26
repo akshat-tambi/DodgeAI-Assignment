@@ -122,6 +122,29 @@ function buildAdjacency(allEdges) {
   return { neighbors, incidentEdges };
 }
 
+function collectNeighborhood(nodeId, adjacency, depth) {
+  if (!nodeId || depth < 0) return new Set();
+  const visited = new Set([nodeId]);
+  let frontier = new Set([nodeId]);
+
+  for (let step = 0; step < depth; step += 1) {
+    const next = new Set();
+    frontier.forEach((curr) => {
+      const neigh = adjacency.neighbors.get(curr) || new Set();
+      neigh.forEach((n) => {
+        if (!visited.has(n)) {
+          visited.add(n);
+          next.add(n);
+        }
+      });
+    });
+    frontier = next;
+    if (!frontier.size) break;
+  }
+
+  return visited;
+}
+
 function FieldList({ fields }) {
   const entries = Object.entries(fields || {});
   if (!entries.length) {
@@ -143,6 +166,7 @@ export default function GraphView({ jobId, graph, selectedNode, onSelectNode, ch
   const [zoomLevel, setZoomLevel] = useState(1);
   const [isFocusLocked, setIsFocusLocked] = useState(false);
   const [lockedFocusNode, setLockedFocusNode] = useState(null);
+  const [expansionDepth, setExpansionDepth] = useState(1);
   const containerRef = useRef(null);
   const sigmaRef = useRef(null);
   const graphRef = useRef(null);
@@ -159,6 +183,22 @@ export default function GraphView({ jobId, graph, selectedNode, onSelectNode, ch
     }
     return nodes.find((n) => n.id === selectedNode)?.data || null;
   }, [nodes, selectedNode]);
+
+  const selectedRelationshipSummary = useMemo(() => {
+    if (!selectedNode) return [];
+    const counts = new Map();
+    allEdges.forEach((edge) => {
+      if (edge.source !== selectedNode && edge.target !== selectedNode) return;
+      const other = edge.source === selectedNode ? edge.target : edge.source;
+      const otherNode = nodes.find((n) => n.id === other);
+      const table = otherNode?.data?.table || 'unknown';
+      counts.set(table, (counts.get(table) || 0) + 1);
+    });
+    return [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([table, count]) => ({ table, count }));
+  }, [allEdges, nodes, selectedNode]);
 
   const edgeStats = useMemo(() => {
     const stats = { data: 0, nested: 0 };
@@ -288,8 +328,13 @@ export default function GraphView({ jobId, graph, selectedNode, onSelectNode, ch
     const highlightedEdgeSet = new Set(chatHighlights?.edgeIds || []);
     const hasChatHighlights = highlightedNodeSet.size > 0 || highlightedEdgeSet.size > 0;
 
-    const selectedNeighbors = new Set(adjacency.neighbors.get(linkFocusNode) || []);
-    const selectedEdges = new Set(adjacency.incidentEdges.get(linkFocusNode) || []);
+    const selectedNeighborhood = collectNeighborhood(linkFocusNode, adjacency, expansionDepth);
+    const selectedEdges = new Set();
+    allEdges.forEach((edge) => {
+      if (selectedNeighborhood.has(edge.source) && selectedNeighborhood.has(edge.target)) {
+        selectedEdges.add(edge.id);
+      }
+    });
 
     sigmaGraph.forEachNode((node, attrs) => {
       if (!selectedNode && !hasChatHighlights) {
@@ -317,7 +362,7 @@ export default function GraphView({ jobId, graph, selectedNode, onSelectNode, ch
 
       const isSelected = node === selectedNode;
       const isLinkFocusNode = node === linkFocusNode;
-      const isNeighbor = selectedNeighbors.has(node);
+      const isNeighbor = selectedNeighborhood.has(node) && node !== linkFocusNode;
       if (isSelected) {
         sigmaGraph.mergeNodeAttributes(node, {
           color: attrs.baseColor || attrs.color,
@@ -392,7 +437,7 @@ export default function GraphView({ jobId, graph, selectedNode, onSelectNode, ch
     });
 
     renderer.refresh();
-  }, [selectedNode, adjacency, isFocusLocked, lockedFocusNode, chatHighlights]);
+  }, [selectedNode, adjacency, allEdges, expansionDepth, isFocusLocked, lockedFocusNode, chatHighlights]);
 
   const renderedEdges = allEdges.length;
 
@@ -406,8 +451,23 @@ export default function GraphView({ jobId, graph, selectedNode, onSelectNode, ch
           <span>{edgeStats.nested} nested links</span>
           <span>Zoom {zoomLevel.toFixed(2)}x</span>
           {isFocusLocked && lockedFocusNode ? <span>Links locked: {lockedFocusNode}</span> : null}
+          <span>Expand depth {expansionDepth}-hop</span>
           {selectedNode ? (
             <>
+              <button
+                className="overlay-btn"
+                type="button"
+                onClick={() => setExpansionDepth((d) => Math.max(1, d - 1))}
+              >
+                - Hop
+              </button>
+              <button
+                className="overlay-btn"
+                type="button"
+                onClick={() => setExpansionDepth((d) => Math.min(4, d + 1))}
+              >
+                + Hop
+              </button>
               <button
                 className="overlay-btn"
                 type="button"
@@ -437,6 +497,14 @@ export default function GraphView({ jobId, graph, selectedNode, onSelectNode, ch
               <p><strong>Table:</strong> {selectedDetails.table}</p>
               <p><strong>Row:</strong> {selectedDetails.rowId}</p>
               <p><strong>Connections:</strong> {selectedDetails.degree}</p>
+              {selectedRelationshipSummary.length ? (
+                <div className="field-list">
+                  <p><strong>Linked Tables</strong></p>
+                  {selectedRelationshipSummary.map((entry) => (
+                    <p key={entry.table}>{entry.table}: {entry.count}</p>
+                  ))}
+                </div>
+              ) : null}
               <FieldList fields={selectedDetails.fields} />
             </>
           )}

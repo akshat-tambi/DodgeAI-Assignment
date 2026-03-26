@@ -71,6 +71,11 @@ export default function ChatPanel({ jobId, selectedNodeId, onHighlights }) {
               <div className="chat-evidence">
                 <p><strong>Rows:</strong> {msg.evidence.row_count}</p>
                 <p><strong>Cypher:</strong> {msg.evidence.cypher || 'n/a'}</p>
+                {(msg.evidence.queries || []).map((q, qIdx) => (
+                  <p key={`${q.stage}-${qIdx}`}>
+                    <strong>{q.stage}:</strong> {q.cypher}
+                  </p>
+                ))}
               </div>
             ) : null}
           </div>

@@ -26,7 +26,7 @@ export default function App() {
 
         if (terminalStates.has(state.status)) {
           if (state.status === 'completed') {
-            const graphResponse = await getGraph('granular');
+            const graphResponse = await getGraph('granular', jobId);
             setGraph({
               nodes: graphResponse.nodes || [],
               edges: graphResponse.edges || [],

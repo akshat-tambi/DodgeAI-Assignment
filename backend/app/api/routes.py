@@ -104,29 +104,34 @@ async def get_job(job_id: str) -> JobStatusResponse:
 
 
 @router.get("/graph", response_model=GraphResponse)
-async def get_latest_graph(view: str = Query("granular", pattern="^(granular|table)$")) -> GraphResponse:
-    latest = await job_store.get_latest()
-    if not latest:
+async def get_latest_graph(
+    view: str = Query("granular", pattern="^(granular|table)$"),
+    job_id: str | None = Query(default=None),
+) -> GraphResponse:
+    target = await job_store.get(job_id) if job_id else await job_store.get_latest()
+    if not target:
+        if job_id:
+            raise HTTPException(status_code=404, detail="Job not found")
         raise HTTPException(status_code=404, detail="No jobs yet")
 
     graph_key = "graph_granular" if view == "granular" else "graph_table"
-    graph = latest.metadata.get(graph_key) or latest.metadata.get("graph", {"nodes": [], "edges": []})
+    graph = target.metadata.get(graph_key) or target.metadata.get("graph", {"nodes": [], "edges": []})
     logger.info(
-        "graph fetch latest_job_id=%s view=%s status=%s nodes=%s edges=%s",
-        latest.job_id,
+        "graph fetch job_id=%s view=%s status=%s nodes=%s edges=%s",
+        target.job_id,
         view,
-        latest.status,
+        target.status,
         len(graph.get("nodes", [])),
         len(graph.get("edges", [])),
     )
     return GraphResponse(
-        job_id=latest.job_id,
+        job_id=target.job_id,
         nodes=graph.get("nodes", []),
         edges=graph.get("edges", []),
         metadata={
-            "status": latest.status,
-            "stage": latest.stage,
-            "message": latest.message,
+            "status": target.status,
+            "stage": target.stage,
+            "message": target.message,
             "view": view,
         },
     )

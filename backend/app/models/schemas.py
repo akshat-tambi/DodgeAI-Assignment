@@ -49,6 +49,7 @@ class ChatEvidence(BaseModel):
     cypher: str
     row_count: int
     reasoning: str
+    queries: List[Dict[str, str]] = []
 
 
 class ChatHighlights(BaseModel):
