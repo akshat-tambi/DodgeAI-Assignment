@@ -1,4 +1,4 @@
-# DodgeAI Assignment
+# Assignment
 
 Graph-based data modeling and dataset-grounded chat system.
 
