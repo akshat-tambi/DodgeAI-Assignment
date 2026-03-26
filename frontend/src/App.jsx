@@ -89,6 +89,7 @@ export default function App() {
       </section>
 
       <GraphView
+        jobId={jobId}
         graph={graph}
         selectedNode={selectedNode}
         onSelectNode={setSelectedNode}

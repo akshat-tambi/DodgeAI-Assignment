@@ -31,7 +31,7 @@ class Neo4jGraphLoader:
             session.run("MATCH (n) DETACH DELETE n")
         logger.info("neo4j wipe completed")
 
-    def load_graph(self, payload: dict[str, Any]) -> None:
+    def load_graph(self, payload: dict[str, Any], *, job_id: str | None = None) -> None:
         if not self.enabled:
             logger.info("neo4j load skipped (loader disabled)")
             return
@@ -40,56 +40,111 @@ class Neo4jGraphLoader:
         edges = payload.get("edges", [])
         logger.info("neo4j load started nodes=%s edges=%s", len(nodes), len(edges))
 
-        with self._driver.session() as session:
-            for node in nodes:
-                session.run(
-                    """
-                    MERGE (n:GraphNode {id: $id})
-                    SET n.label = $label,
-                        n.entity = $entity,
-                        n.data = $data
-                    """,
-                    id=node["id"],
-                    label=node.get("label", node["id"]),
-                    entity=node.get("data", {}).get("entity", "unknown"),
-                    data=json.dumps(node.get("data", {})),
-                )
+        def _chunks(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+            return [items[i : i + size] for i in range(0, len(items), size)]
 
-            for edge in edges:
+        node_rows = [
+            {
+                "id": node["id"],
+                "label": node.get("label", node["id"]),
+                "entity": node.get("data", {}).get("entity", "unknown"),
+                "data": json.dumps(node.get("data", {})),
+            }
+            for node in nodes
+            if node.get("id")
+        ]
+
+        edge_rows = [
+            {
+                "id": edge["id"],
+                "source": edge["source"],
+                "target": edge["target"],
+                "label": edge.get("label", ""),
+                "score": float(edge.get("data", {}).get("score", 0.0)),
+                "columns": json.dumps(
+                    edge.get("data", {}).get(
+                        "mappings",
+                        [
+                            {
+                                "source_column": edge.get("data", {}).get("column_a"),
+                                "target_column": edge.get("data", {}).get("column_b"),
+                            }
+                        ],
+                    )
+                ),
+                "relationship_type": edge.get("data", {}).get("relationship_type", "unknown"),
+                "overlap_ratio": float(edge.get("data", {}).get("overlap_ratio", 0.0)),
+                "edge_type": edge.get("data", {}).get("edge_type", "UNKNOWN"),
+            }
+            for edge in edges
+            if edge.get("id") and edge.get("source") and edge.get("target")
+        ]
+
+        with self._driver.session() as session:
+            node_batches = _chunks(node_rows, 500)
+            for idx, batch in enumerate(node_batches, start=1):
                 session.run(
                     """
-                    MATCH (a:GraphNode {id: $source})
-                    MATCH (b:GraphNode {id: $target})
-                    MERGE (a)-[r:GRAPH_EDGE {id: $id}]->(b)
-                    SET r.label = $label,
-                        r.score = $score,
-                        r.columns = $columns,
-                        r.relationship_type = $relationship_type,
-                        r.overlap_ratio = $overlap_ratio,
-                        r.edge_type = $edge_type
+                    UNWIND $rows AS row
+                    MERGE (n:GraphNode {id: row.id})
+                    SET n.label = row.label,
+                        n.entity = row.entity,
+                        n.data = row.data
                     """,
-                    id=edge["id"],
-                    source=edge["source"],
-                    target=edge["target"],
-                    label=edge.get("label", ""),
-                    score=float(edge.get("data", {}).get("score", 0.0)),
-                    columns=json.dumps(
-                        edge.get("data", {}).get(
-                            "mappings",
-                            [
-                                {
-                                    "source_column": edge.get("data", {}).get("column_a"),
-                                    "target_column": edge.get("data", {}).get("column_b"),
-                                }
-                            ],
-                        )
-                    ),
-                    relationship_type=edge.get("data", {}).get("relationship_type", "unknown"),
-                    overlap_ratio=float(edge.get("data", {}).get("overlap_ratio", 0.0)),
-                    edge_type=edge.get("data", {}).get("edge_type", "UNKNOWN"),
+                    rows=batch,
                 )
+                logger.info("neo4j load nodes batch=%s/%s size=%s", idx, len(node_batches), len(batch))
+
+            edge_batches = _chunks(edge_rows, 500)
+            for idx, batch in enumerate(edge_batches, start=1):
+                session.run(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (a:GraphNode {id: row.source})
+                    MATCH (b:GraphNode {id: row.target})
+                    MERGE (a)-[r:GRAPH_EDGE {id: row.id}]->(b)
+                    SET r.label = row.label,
+                        r.score = row.score,
+                        r.columns = row.columns,
+                        r.relationship_type = row.relationship_type,
+                        r.overlap_ratio = row.overlap_ratio,
+                        r.edge_type = row.edge_type
+                    """,
+                    rows=batch,
+                )
+                logger.info("neo4j load edges batch=%s/%s size=%s", idx, len(edge_batches), len(batch))
+
+            if job_id:
+                session.run(
+                    """
+                    MERGE (m:GraphMeta {key: 'active'})
+                    SET m.job_id = $job_id,
+                        m.updated_at = timestamp()
+                    """,
+                    job_id=job_id,
+                )
+                logger.info("neo4j active graph marker set job_id=%s", job_id)
 
         logger.info("neo4j load completed")
+
+    def get_active_job_id(self) -> str | None:
+        if not self.enabled:
+            return None
+
+        with self._driver.session() as session:
+            has_label = session.run(
+                "CALL db.labels() YIELD label WHERE label = 'GraphMeta' RETURN label LIMIT 1"
+            ).single()
+            if not has_label:
+                return None
+
+            record = session.run(
+                "MATCH (m:GraphMeta {key: 'active'}) RETURN m.job_id AS job_id LIMIT 1"
+            ).single()
+            if not record:
+                return None
+            value = record.get("job_id")
+            return str(value) if value else None
 
     def fetch_graph(self) -> dict[str, Any]:
         if not self.enabled:

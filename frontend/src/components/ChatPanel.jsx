@@ -1,16 +1,22 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { queryChat } from '../api/client';
 
-export default function ChatPanel({ selectedNodeId, onHighlights }) {
+export default function ChatPanel({ jobId, selectedNodeId, onHighlights }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [conversationId, setConversationId] = useState('');
   const [messages, setMessages] = useState([]);
 
+  useEffect(() => {
+    setConversationId('');
+    setMessages([]);
+    setError('');
+  }, [jobId]);
+
   const handleSend = async () => {
     const question = input.trim();
-    if (!question || loading) return;
+    if (!question || loading || !jobId) return;
 
     setError('');
     setLoading(true);
@@ -19,6 +25,7 @@ export default function ChatPanel({ selectedNodeId, onHighlights }) {
 
     try {
       const result = await queryChat({
+        jobId,
         question,
         conversationId,
         selectedNodeId,
@@ -72,6 +79,8 @@ export default function ChatPanel({ selectedNodeId, onHighlights }) {
 
       {error ? <p className="error">{error}</p> : null}
 
+      {!jobId ? <p className="muted">Upload and process a dataset first to enable chat.</p> : null}
+
       <div className="chat-input-row">
         <input
           value={input}
@@ -81,7 +90,7 @@ export default function ChatPanel({ selectedNodeId, onHighlights }) {
             if (e.key === 'Enter') handleSend();
           }}
         />
-        <button type="button" onClick={handleSend} disabled={loading || !input.trim()}>
+        <button type="button" onClick={handleSend} disabled={loading || !input.trim() || !jobId}>
           {loading ? '...' : 'Send'}
         </button>
       </div>

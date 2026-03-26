@@ -35,13 +35,14 @@ export async function getGraph(view = 'granular') {
   return response.json();
 }
 
-export async function queryChat({ question, conversationId, selectedNodeId }) {
+export async function queryChat({ jobId, question, conversationId, selectedNodeId }) {
   const response = await fetch(`${API_BASE}/chat`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
+      job_id: jobId,
       question,
       conversation_id: conversationId || null,
       selected_node_id: selectedNodeId || null,

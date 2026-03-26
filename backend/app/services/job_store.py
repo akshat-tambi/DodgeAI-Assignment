@@ -102,15 +102,26 @@ class JobStore:
                 """
                 CREATE TABLE IF NOT EXISTS conversations (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    job_id VARCHAR(64) NOT NULL,
                     conversation_id VARCHAR(64) NOT NULL,
                     turn_index INT NOT NULL,
                     user_message TEXT NOT NULL,
                     assistant_message TEXT NOT NULL,
                     ts DOUBLE NOT NULL,
-                    INDEX idx_conversation_turn (conversation_id, turn_index)
+                    INDEX idx_job_conversation_turn (job_id, conversation_id, turn_index)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """
             )
+            try:
+                cur.execute("ALTER TABLE conversations ADD COLUMN job_id VARCHAR(64) NOT NULL DEFAULT ''")
+            except Exception:
+                pass
+            try:
+                cur.execute(
+                    "CREATE INDEX idx_job_conversation_turn ON conversations (job_id, conversation_id, turn_index)"
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _loads_metadata(raw: Any) -> Dict[str, Any]:
@@ -221,19 +232,19 @@ class JobStore:
                 row = cur.fetchone()
                 return self._to_state(row) if row else None
 
-    async def get_conversation(self, conversation_id: str, max_turns: int = 10) -> list[dict[str, Any]]:
+    async def get_conversation(self, conversation_id: str, *, job_id: str, max_turns: int = 10) -> list[dict[str, Any]]:
         async with self._lock:
             lim = max(1, int(max_turns))
             with self._conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT conversation_id, turn_index, user_message, assistant_message, ts
+                    SELECT job_id, conversation_id, turn_index, user_message, assistant_message, ts
                     FROM conversations
-                    WHERE conversation_id=%s
+                    WHERE conversation_id=%s AND job_id=%s
                     ORDER BY turn_index DESC
                     LIMIT %s
                     """,
-                    (conversation_id, lim),
+                    (conversation_id, job_id, lim),
                 )
                 rows = list(reversed(cur.fetchall() or []))
                 return [
@@ -248,33 +259,35 @@ class JobStore:
     async def append_conversation_turn(
         self,
         conversation_id: str,
+        *,
+        job_id: str,
         user_message: str,
         assistant_message: str,
-        *,
         max_turns: int = 12,
     ) -> None:
         async with self._lock:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COALESCE(MAX(turn_index), 0) AS max_idx FROM conversations WHERE conversation_id=%s",
-                    (conversation_id,),
+                    "SELECT COALESCE(MAX(turn_index), 0) AS max_idx FROM conversations WHERE conversation_id=%s AND job_id=%s",
+                    (conversation_id, job_id),
                 )
                 row = cur.fetchone() or {"max_idx": 0}
                 next_index = int(row.get("max_idx", 0)) + 1
                 ts = time.time()
                 cur.execute(
                     """
-                    INSERT INTO conversations (conversation_id, turn_index, user_message, assistant_message, ts)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO conversations (job_id, conversation_id, turn_index, user_message, assistant_message, ts)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     """,
-                    (conversation_id, next_index, user_message, assistant_message, ts),
+                    (job_id, conversation_id, next_index, user_message, assistant_message, ts),
                 )
                 if max_turns > 0:
                     cur.execute(
                         """
                         DELETE FROM conversations
                         WHERE conversation_id=%s
+                          AND job_id=%s
                           AND turn_index <= %s
                         """,
-                        (conversation_id, max(0, next_index - max_turns)),
+                        (conversation_id, job_id, max(0, next_index - max_turns)),
                     )

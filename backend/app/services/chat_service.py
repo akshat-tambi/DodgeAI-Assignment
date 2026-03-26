@@ -62,33 +62,51 @@ class ChatService:
         self.model = groq_model
         self.neo4j_loader = neo4j_loader
         self.job_store = job_store
+        self._active_job_id: str | None = None
 
     async def answer(
         self,
         *,
+        job_id: str,
         question: str,
         conversation_id: str | None,
         selected_node_id: str | None,
     ) -> dict[str, Any]:
         conv_id = conversation_id or str(uuid.uuid4())
-        latest = await self.job_store.get_latest()
-        if not latest or latest.status != "completed":
+        state = await self.job_store.get(job_id)
+        if not state:
             return {
+                "job_id": job_id,
                 "conversation_id": conv_id,
-                "answer": "No completed graph is available yet. Upload data and wait for processing to complete.",
+                "answer": "No job was found for the provided job_id.",
                 "domain_allowed": True,
                 "evidence": {
                     "cypher": "",
                     "row_count": 0,
-                    "reasoning": "No completed graph context",
+                    "reasoning": "Unknown job_id",
                 },
                 "highlights": {"node_ids": [], "edge_ids": []},
             }
 
-        dataset_context = latest.metadata.get("dataset_context", {})
-
-        if not self._is_domain_question(question, dataset_context=dataset_context, metadata=latest.metadata):
+        if state.status != "completed":
             return {
+                "job_id": job_id,
+                "conversation_id": conv_id,
+                "answer": "This upload is still processing. Wait for completion before using chat.",
+                "domain_allowed": True,
+                "evidence": {
+                    "cypher": "",
+                    "row_count": 0,
+                    "reasoning": "Job not completed",
+                },
+                "highlights": {"node_ids": [], "edge_ids": []},
+            }
+
+        dataset_context = state.metadata.get("dataset_context", {})
+
+        if not self._is_domain_question(question, dataset_context=dataset_context, metadata=state.metadata):
+            return {
+                "job_id": job_id,
                 "conversation_id": conv_id,
                 "answer": _OFF_TOPIC_MESSAGE,
                 "domain_allowed": False,
@@ -100,11 +118,13 @@ class ChatService:
                 "highlights": {"node_ids": [], "edge_ids": []},
             }
 
-        history = await self.job_store.get_conversation(conv_id, max_turns=8)
+        await self._ensure_job_graph_loaded(job_id=job_id, metadata=state.metadata)
+
+        history = await self.job_store.get_conversation(conv_id, job_id=job_id, max_turns=8)
         planner = self._plan_query(
             question=question,
             selected_node_id=selected_node_id,
-            metadata=latest.metadata,
+            metadata=state.metadata,
             history=history,
             dataset_context=dataset_context,
         )
@@ -112,6 +132,7 @@ class ChatService:
         cypher = self._sanitize_read_only_cypher(str(planner.get("cypher", "")))
         if not cypher:
             return {
+                "job_id": job_id,
                 "conversation_id": conv_id,
                 "answer": "I could not produce a safe graph query for that request. Please rephrase with dataset entities.",
                 "domain_allowed": True,
@@ -133,11 +154,13 @@ class ChatService:
 
         await self.job_store.append_conversation_turn(
             conv_id,
+            job_id=job_id,
             user_message=question,
             assistant_message=answer,
         )
 
         return {
+            "job_id": job_id,
             "conversation_id": conv_id,
             "answer": answer,
             "domain_allowed": True,
@@ -148,6 +171,24 @@ class ChatService:
             },
             "highlights": highlights,
         }
+
+    async def _ensure_job_graph_loaded(self, *, job_id: str, metadata: dict[str, Any]) -> None:
+        if self._active_job_id == job_id:
+            return
+
+        active_job_id = self.neo4j_loader.get_active_job_id()
+        if active_job_id and active_job_id == job_id:
+            self._active_job_id = job_id
+            return
+
+        payload = metadata.get("graph_granular") or metadata.get("graph")
+        if not isinstance(payload, dict):
+            self._active_job_id = None
+            return
+
+        self.neo4j_loader.wipe_graph()
+        self.neo4j_loader.load_graph(payload, job_id=job_id)
+        self._active_job_id = job_id
 
     def _is_domain_question(self, question: str, *, dataset_context: dict[str, Any], metadata: dict[str, Any]) -> bool:
         q = question.lower()
@@ -301,6 +342,8 @@ class ChatService:
         if rewritten:
             query = rewritten
 
+        query = self._normalize_data_regex_predicates(query)
+
         lowered = re.sub(r"\s+", " ", query.lower())
         if ";" in query:
             return ""
@@ -314,6 +357,27 @@ class ChatService:
         if " limit " not in lowered:
             query = f"{query} LIMIT 50"
         return query
+
+    def _normalize_data_regex_predicates(self, query: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            raw = match.group("pattern")
+            if not raw:
+                return match.group(0)
+
+            # If caller already supplied a broad match, keep it as-is.
+            if ".*" in raw:
+                return match.group(0)
+
+            pattern = raw
+            prefix = ""
+            if pattern.startswith("(?i)"):
+                prefix = "(?i)"
+                pattern = pattern[4:]
+
+            normalized = f"{prefix}.*{pattern}.*"
+            return f"n.data =~ '{normalized}'"
+
+        return re.sub(r"n\.data\s*=~\s*'(?P<pattern>[^']*)'", repl, query, flags=re.IGNORECASE)
 
     def _rewrite_legacy_node_lookup_query(self, query: str) -> str | None:
         text = (query or "").strip()

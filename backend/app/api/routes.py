@@ -134,11 +134,15 @@ async def get_latest_graph(view: str = Query("granular", pattern="^(granular|tab
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_with_graph(payload: ChatRequest) -> ChatResponse:
+    job_id = (payload.job_id or "").strip()
     question = (payload.question or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id is required")
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
     result = await chat_service.answer(
+        job_id=job_id,
         question=question,
         conversation_id=payload.conversation_id,
         selected_node_id=payload.selected_node_id,

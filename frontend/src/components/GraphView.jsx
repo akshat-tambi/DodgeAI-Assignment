@@ -139,7 +139,7 @@ function FieldList({ fields }) {
   );
 }
 
-export default function GraphView({ graph, selectedNode, onSelectNode, chatHighlights, onChatHighlights }) {
+export default function GraphView({ jobId, graph, selectedNode, onSelectNode, chatHighlights, onChatHighlights }) {
   const [zoomLevel, setZoomLevel] = useState(1);
   const [isFocusLocked, setIsFocusLocked] = useState(false);
   const [lockedFocusNode, setLockedFocusNode] = useState(null);
@@ -443,6 +443,7 @@ export default function GraphView({ graph, selectedNode, onSelectNode, chatHighl
         </div>
 
         <ChatPanel
+          jobId={jobId}
           selectedNodeId={selectedNode}
           onHighlights={(next) => onChatHighlights(next)}
         />

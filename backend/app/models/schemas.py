@@ -39,6 +39,7 @@ class GraphResponse(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    job_id: str
     question: str
     conversation_id: Optional[str] = None
     selected_node_id: Optional[str] = None
@@ -56,6 +57,7 @@ class ChatHighlights(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    job_id: str
     conversation_id: str
     answer: str
     domain_allowed: bool

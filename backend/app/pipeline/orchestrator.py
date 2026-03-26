@@ -294,7 +294,7 @@ async def process_upload_job(
         )
 
         await update_stage("neo4j_load", "Loading graph into Neo4j")
-        neo4j_loader.load_graph(granular_graph_payload)
+        neo4j_loader.load_graph(granular_graph_payload, job_id=job_id)
         neo4j_graph = neo4j_loader.fetch_graph()
         logger.info(
             "pipeline neo4j_load job_id=%s persisted_nodes=%s persisted_edges=%s",
