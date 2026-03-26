@@ -146,14 +146,23 @@ async def process_upload_job(
             settings.max_relationships_per_table_pair,
         )
 
-        await update_stage("llm_refinement", "Refining borderline relationships")
-        refined_borderline = groq_refiner.refine(borderline, schemas)
-        accepted.extend([r for r in refined_borderline if r.get("decision") == "accepted"])
+        await update_stage("llm_refinement", "Verifying inferred relationships with Groq")
+        inferred_for_verification = [*accepted, *borderline]
+        verified_inferred = groq_refiner.verify_all(
+            inferred_for_verification,
+            relationalized_tables,
+            schemas,
+        )
+        accepted = [r for r in verified_inferred if r.get("decision") == "accepted"]
+        llm_rejected = [r for r in verified_inferred if r.get("decision") == "rejected"]
+        rejected.extend(llm_rejected)
+        borderline = [r for r in verified_inferred if r.get("decision") == "borderline"]
         logger.info(
-            "pipeline llm_refinement job_id=%s refined_total=%s accepted_after_refine=%s",
+            "pipeline llm_refinement job_id=%s verified_total=%s accepted_after_verify=%s rejected_after_verify=%s",
             job_id,
-            len(refined_borderline),
+            len(verified_inferred),
             len(accepted),
+            len(llm_rejected),
         )
 
         await update_stage("graph_build", "Building graph payload")
